@@ -18,6 +18,7 @@
 
 import functools
 import os
+import jax
 import numpy as np
 
 from trax import layers as tl
@@ -174,7 +175,6 @@ class AdvantageActorCriticTrainer(ActorCriticTrainer):
   """The Advantage Actor Critic Algorithm aka A2C.
 
   Trains policy and value models using the A2C algortithm.
-  This is a variant with separate value and policy models.
   """
 
   def __init__(self, task, **kwargs):
@@ -194,3 +194,49 @@ class AdvantageActorCriticTrainer(ActorCriticTrainer):
     """Policy loss."""
     return functools.partial(
         distributions.LogLoss, distribution=self._policy_dist)
+
+
+class PPOTrainer(ActorCriticTrainer):
+  """The Proximal Policy Optimization Algorithm aka PPO.
+
+  Trains policy and value models using the PPO algortithm.
+  """
+
+  def __init__(self, task, ppo_eps=0.2, **kwargs):
+    """Configures the a2c Trainer."""
+    self.ppo_eps = ppo_eps
+    super(PPOTrainer, self).__init__(task, **kwargs)
+
+  def policy_inputs(self, trajectory, values):
+    """Create inputs to policy model from a TrajectoryNp and values."""
+    advantages = trajectory.returns[:, :-1] - values[:, :-1]
+    # The old log_probs were recorder together with the trajectory
+    old_log_probs = trajectory.log_probs[:, :-1]
+
+    return (
+        trajectory.observations,
+        trajectory.actions,
+        advantages,
+        old_log_probs)
+
+  # How do we make sure that log_probs from the network end up as
+  # new_log_probs?
+  def ppo_loss(self, new_log_probs, advantages, old_log_probs, **kwargs):
+    # here we are working around the fact that we record
+    # log_probs in the trajectory (and not probs)
+    probs_ratio = np.exp(new_log_probs)/np.exp(self.old_log_probs)
+    unclipped_objective = probs_ratio * advantages
+    clipped_objective = jax.lax.clamp(1 - self.ppo_eps,
+                                      probs_ratio,
+                                      1 + self.ppo_eps) * advantages
+    # calculate the min of the two objectives
+    stacked_objectives = np.stack([unclipped_objective, clipped_objective], 0)
+    ppo_objective = np.min(stacked_objectives, 0)
+    # the nial target should be the minus average of the objective
+    return -ppo_objective.mean()
+
+  @property
+  def policy_loss(self):
+    """Policy loss."""
+    return self.ppo_loss
+
