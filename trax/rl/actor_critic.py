@@ -45,6 +45,7 @@ class ActorCriticTrainer(rl_training.PolicyTrainer):
                value_batch_size=64,
                value_train_steps_per_epoch=500,
                n_shared_layers=0,
+               added_policy_slice_length=0,
                **kwargs):  # Arguments of PolicyTrainer come here.
     """Configures the actor-critic Trainer."""
     self._n_shared_layers = n_shared_layers
@@ -56,6 +57,7 @@ class ActorCriticTrainer(rl_training.PolicyTrainer):
     # since policy input creation calls the value model -- hence this code.
     self._task = task
     self._max_slice_length = kwargs.get('max_slice_length', None)
+    self._added_policy_slice_length = added_policy_slice_length
 
     # Initialize training of the value function.
     value_output_dir = kwargs.get('output_dir', None)
@@ -110,18 +112,17 @@ class ActorCriticTrainer(rl_training.PolicyTrainer):
       epochs = [-1]
     else:
       epochs = None
+    max_slice_len = self._max_slice_length + self._added_policy_slice_length
     for np_trajectory in self._task.trajectory_batch_stream(
         self._policy_batch_size,
         epochs=epochs,
-        max_slice_length=self._max_slice_length + 1,
-        include_final_state=True,
-        sample_trajectories_uniformly=True):
+        max_slice_length=max_slice_len,
+        include_final_state=(max_slice_len > 1)):
       value_model = self._value_eval_model
       value_model.weights = self._value_trainer.model_weights
       values = value_model(np_trajectory.observations, n_accelerators=1)
       shapes.assert_shape_equals(
-          values, (self._policy_batch_size, self._max_slice_length + 1, 1)
-      )
+          values, (self._policy_batch_size, max_slice_len, 1))
       values = np.squeeze(values, axis=2)  # Remove the singleton depth dim.
       yield self.policy_inputs(np_trajectory, values)
 
@@ -158,6 +159,38 @@ def _copy_model_weights(start, end, from_trainer, to_trainer,
     # pylint: enable=protected-access
 
 
+def calculate_advantage(trajectory, values, gamma, n_steps):
+  """Calculate advantage, the default way if n_steps=0, else using TD(gamma).
+
+  We assume the values are a tensor of shape [batch_size, length] and this
+  is the same shape as trajectory.rewards and trajectory.returns.
+
+  If n_steps is 0, the advantages are defined as: returns - values.
+  For larger n_steps, we use TD(gamma) and calculate advantage(s_i) as:
+    gamma^n_steps * value(s_{i + n_steps}) - value(s_i) - discounted_rewards
+  where discounted_rewards is the sum of rewards in these steps with proper
+  discounting by powers of gamma.
+
+  Args:
+    trajectory: the trajectory for which to calculate advantage
+    values: the value function computed for this trajectory
+    gamma: float, gamma parameter for TD from the underlying task
+    n_steps: for how many steps to do TD (if 0, we use default advantage)
+
+  Returns:
+    the advantages, a tensor of shape [batch_size, length - n_steps].
+  """
+  if n_steps < 1:  # Default advantage: returns - values.
+    return trajectory.returns - values
+  # Here we calculate advantage with TD(gamma) used for n steps.
+  cur_advantage = (gamma**n_steps) * values[:, n_steps:] - values[:, :-n_steps]
+  discount = 1.0
+  for i in range(n_steps):
+    cur_advantage += discount * trajectory.rewards[:, i:-(n_steps - i)]
+    discount *= gamma
+  return cur_advantage
+
+
 class AWRTrainer(ActorCriticTrainer):
   """Trains policy and value models using AWR."""
 
@@ -171,17 +204,16 @@ class AWRTrainer(ActorCriticTrainer):
 
   def policy_inputs(self, trajectory, values):
     """Create inputs to policy model from a TrajectoryNp and values."""
-    rew = trajectory.rewards[:, :-1]
-    td_advantage = rew + self._task.gamma * values[:, 1:] - values[:, :-1]
-    # advantage = trajectory.returns[:, :-1] - values[:, :-1]
-    awr_weights = np.minimum(np.exp(td_advantage / self._beta), self._w_max)
+    td = self._added_policy_slice_length
+    advantage = calculate_advantage(trajectory, values, self._task.gamma, td)
+    awr_weights = np.minimum(np.exp(advantage / self._beta), self._w_max)
     # Observations should be the same length as awr_weights - so if we are
-    # using td_advantage, we need to cut one (as we need the value of
-    # one more state to subtract.
-    return (
-        trajectory.observations[:, :-1],
-        trajectory.actions[:, :-1],
-        awr_weights)
+    # using td_advantage, we need to cut td-man out from the end.
+    obs = trajectory.observations
+    obs = obs[:, :-td] if td > 0 else obs
+    act = trajectory.actions
+    act = act[:, :-td] if td > 0 else act
+    return (obs, act, awr_weights)
 
   @property
   def policy_loss(self):
